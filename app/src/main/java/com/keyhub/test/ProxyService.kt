@@ -40,6 +40,8 @@ class ProxyService : Service() {
     companion object {
         const val PORT = 8787
         private const val CHANNEL = "keyhub_proxy"
+        private const val CORS =
+            "Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: *\r\n"
 
         @Volatile
         var running = false
@@ -168,6 +170,7 @@ class ProxyService : Service() {
         val head = "HTTP/1.1 $code ${if (code < 400) "OK" else "Error"}\r\n" +
             "Content-Type: application/json\r\n" +
             "Content-Length: ${b.size}\r\n" +
+            CORS +
             "Connection: close\r\n\r\n"
         out.write(head.toByteArray(Charsets.ISO_8859_1))
         out.write(b)
@@ -238,7 +241,17 @@ class ProxyService : Service() {
             }
 
         if (method == "OPTIONS") {
-            sendSimple(out, 204, "")
+            val reqH = headers["access-control-request-headers"] ?: "authorization, content-type"
+            val resp = "HTTP/1.1 204 No Content\r\n" +
+                CORS +
+                "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" +
+                "Access-Control-Allow-Headers: $reqH\r\n" +
+                "Access-Control-Allow-Private-Network: true\r\n" +
+                "Access-Control-Max-Age: 86400\r\n" +
+                "Content-Length: 0\r\n" +
+                "Connection: close\r\n\r\n"
+            out.write(resp.toByteArray(Charsets.ISO_8859_1))
+            out.flush()
             return
         }
         if (target == "/" || target.startsWith("/health")) {
@@ -319,6 +332,7 @@ class ProxyService : Service() {
             val head = "HTTP/1.1 $statusCode $msg\r\n" +
                 "Content-Type: $ctype\r\n" +
                 "Cache-Control: no-cache\r\n" +
+                CORS +
                 "X-Accel-Buffering: no\r\n" +
                 "Connection: close\r\n\r\n"
             out.write(head.toByteArray(Charsets.ISO_8859_1))
