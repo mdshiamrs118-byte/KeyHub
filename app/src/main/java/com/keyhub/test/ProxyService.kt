@@ -100,7 +100,7 @@ class ProxyService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val n = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_key)
             .setContentTitle("KeyHub proxy running")
             .setContentText("127.0.0.1:$PORT")
             .setContentIntent(pi)
