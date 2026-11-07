@@ -18,6 +18,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
@@ -32,8 +33,9 @@ class UsageInfo {
 /**
  * Local OpenAI-compatible proxy on 127.0.0.1:8787.
  * Other apps use  http://127.0.0.1:8787/v1  +  the universal key.
- * We swap in the real OpenRouter key, forward the request, stream the answer
- * back, and log token usage.
+ * We pick one of your OpenRouter keys, forward the request, stream the answer
+ * back, and log token usage. If a key fails (invalid / out of credit / rate
+ * limited) the next key is tried automatically.
  */
 class ProxyService : Service() {
 
@@ -48,6 +50,18 @@ class ProxyService : Service() {
 
         @Volatile
         var lastError: String? = null
+
+        /** id of the key that served the last successful request */
+        @Volatile
+        var activeKeyId: String? = null
+
+        /** key id -> time (ms) until which the key is skipped */
+        val cooldownUntil = ConcurrentHashMap<String, Long>()
+
+        /** key id -> last failing HTTP status */
+        val lastFailCode = ConcurrentHashMap<String, Int>()
+
+        private val FAILOVER = setOf(401, 402, 403, 429)
 
         private val SKIP_REQ = setOf(
             "host", "authorization", "x-api-key", "content-length", "connection",
@@ -200,6 +214,42 @@ class ProxyService : Service() {
         }
     }
 
+    private fun logRow(
+        k: ApiKey?, model: String, u: UsageInfo?, status: Int, path: String, ms: Long
+    ) {
+        try {
+            UsageDb.get(this).add(
+                UsageRow(
+                    System.currentTimeMillis(), model,
+                    u?.prompt ?: 0, u?.completion ?: 0, u?.total ?: 0, u?.cost ?: 0.0,
+                    status, path, k?.id ?: "", k?.label ?: "", ms
+                )
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun openUpstream(
+        url: String, method: String, headers: Map<String, String>, body: ByteArray, real: String
+    ): HttpURLConnection {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = method
+        c.connectTimeout = 30000
+        c.readTimeout = 300000
+        c.instanceFollowRedirects = false
+        for ((k, v) in headers) {
+            if (k !in SKIP_REQ) c.setRequestProperty(k, v)
+        }
+        c.setRequestProperty("Authorization", "Bearer $real")
+        c.setRequestProperty("Accept-Encoding", "identity")
+        if (body.isNotEmpty() && method != "GET" && method != "HEAD") {
+            c.doOutput = true
+            c.setFixedLengthStreamingMode(body.size)
+            c.outputStream.use { it.write(body) }
+        }
+        return c
+    }
+
     // ---------- connection handling ----------
 
     private fun handle(sock: Socket) {
@@ -270,11 +320,15 @@ class ProxyService : Service() {
             sendSimple(out, 401, errJson("Invalid KeyHub key", 401))
             return
         }
-        val real = Secrets.realKey(this)
-        if (real.isNullOrEmpty()) {
-            sendSimple(out, 503, errJson("No OpenRouter key saved in KeyHub", 503))
+
+        val keys = Secrets.keys(this).filter { it.enabled }
+        if (keys.isEmpty()) {
+            sendSimple(out, 503, errJson("No enabled OpenRouter key in KeyHub", 503))
             return
         }
+        val nowMs = System.currentTimeMillis()
+        val ready = keys.filter { (cooldownUntil[it.id] ?: 0L) <= nowMs }
+        val order = ready + keys.filter { k -> ready.none { it.id == k.id } }
 
         // build upstream path
         var p = target
@@ -305,28 +359,57 @@ class ProxyService : Service() {
 
         val usage = UsageInfo()
         var statusCode = 0
+        var usedKey: ApiKey? = null
         var conn: HttpURLConnection? = null
+        val t0 = System.currentTimeMillis()
         try {
-            conn = URL(url).openConnection() as HttpURLConnection
-            conn.requestMethod = method
-            conn.connectTimeout = 30000
-            conn.readTimeout = 300000
-            conn.instanceFollowRedirects = false
-            for ((k, v) in headers) {
-                if (k !in SKIP_REQ) conn.setRequestProperty(k, v)
-            }
-            conn.setRequestProperty("Authorization", "Bearer $real")
-            conn.setRequestProperty("Accept-Encoding", "identity")
-            if (body.isNotEmpty() && method != "GET" && method != "HEAD") {
-                conn.doOutput = true
-                conn.setFixedLengthStreamingMode(body.size)
-                conn.outputStream.use { it.write(body) }
+            // try keys in order; move on when a key is rejected
+            for ((idx, k) in order.withIndex()) {
+                val real = Secrets.keyValue(k)
+                if (real.isNullOrEmpty()) continue
+                val isLast = idx == order.size - 1
+                var c: HttpURLConnection? = null
+                try {
+                    c = openUpstream(url, method, headers, body, real)
+                    val code = c.responseCode
+                    if (code in FAILOVER && !isLast) {
+                        cooldownUntil[k.id] =
+                            System.currentTimeMillis() + (if (code == 429) 60_000L else 600_000L)
+                        lastFailCode[k.id] = code
+                        if (method == "POST") {
+                            logRow(k, reqModel, null, code, p, System.currentTimeMillis() - t0)
+                        }
+                        c.disconnect()
+                        continue
+                    }
+                    conn = c
+                    usedKey = k
+                    statusCode = code
+                    break
+                } catch (e: Exception) {
+                    try {
+                        c?.disconnect()
+                    } catch (_: Exception) {
+                    }
+                    if (isLast) throw e
+                }
             }
 
-            statusCode = conn.responseCode
-            val ctype = conn.contentType ?: "application/json"
-            val upstream: InputStream? = if (statusCode >= 400) conn.errorStream else conn.inputStream
-            val msg = conn.responseMessage?.takeIf { it.isNotBlank() }
+            val cn = conn ?: throw Exception("No usable key")
+            val key = usedKey
+            if (key != null && statusCode < 400) {
+                cooldownUntil.remove(key.id)
+                lastFailCode.remove(key.id)
+                activeKeyId = key.id
+            } else if (key != null && statusCode in FAILOVER) {
+                cooldownUntil[key.id] =
+                    System.currentTimeMillis() + (if (statusCode == 429) 60_000L else 600_000L)
+                lastFailCode[key.id] = statusCode
+            }
+
+            val ctype = cn.contentType ?: "application/json"
+            val upstream: InputStream? = if (statusCode >= 400) cn.errorStream else cn.inputStream
+            val msg = cn.responseMessage?.takeIf { it.isNotBlank() }
                 ?: (if (statusCode < 400) "OK" else "Error")
 
             val head = "HTTP/1.1 $statusCode $msg\r\n" +
@@ -386,13 +469,9 @@ class ProxyService : Service() {
         }
 
         if (method == "POST") {
-            UsageDb.get(this).add(
-                UsageRow(
-                    System.currentTimeMillis(),
-                    usage.model.ifEmpty { reqModel },
-                    usage.prompt, usage.completion, usage.total, usage.cost,
-                    statusCode, p
-                )
+            logRow(
+                usedKey, usage.model.ifEmpty { reqModel }, usage, statusCode, p,
+                System.currentTimeMillis() - t0
             )
         }
     }
