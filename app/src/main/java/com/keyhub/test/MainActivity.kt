@@ -61,6 +61,9 @@ class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
     private val baseUrl = "http://127.0.0.1:${ProxyService.PORT}/v1"
+    private val baseUrlGemini = "http://127.0.0.1:${ProxyService.PORT}/gemini/v1"
+    private val providers = listOf("openrouter" to "OpenRouter", "gemini" to "Gemini")
+    private val geminiNoPrice = -2.0
 
     // shell
     private lateinit var frame: FrameLayout
@@ -75,8 +78,10 @@ class MainActivity : Activity() {
     private lateinit var proxySub: TextView
     private lateinit var proxyToggle: TextView
     private lateinit var universalView: TextView
-    private lateinit var activeKeyText: TextView
-    private lateinit var activeSubText: TextView
+    private lateinit var activeOr: TextView
+    private lateinit var subOr: TextView
+    private lateinit var activeGem: TextView
+    private lateinit var subGem: TextView
     private lateinit var todayReq: TextView
     private lateinit var todayTok: TextView
     private lateinit var todayCost: TextView
@@ -102,9 +107,13 @@ class MainActivity : Activity() {
     private lateinit var modelStatus: TextView
     private lateinit var modelSearch: EditText
     private val modelAdapter = RowAdapter<ModelInfo> { m -> modelRow(m) }
+    private val provPills = ArrayList<TextView>()
     private val modelPills = ArrayList<TextView>()
-    private var allModels: List<ModelInfo> = emptyList()
-    private var modelsLoading = false
+    private var orModels: List<ModelInfo> = emptyList()
+    private var gemModels: List<ModelInfo> = emptyList()
+    private var orLoading = false
+    private var gemLoading = false
+    private var modelProvider = 0 // 0 openrouter, 1 gemini
     private var freeOnly = false
 
     private val ticker = object : Runnable {
@@ -196,7 +205,7 @@ class MainActivity : Activity() {
                 fetchBalances()
             }
             2 -> refreshHistory()
-            3 -> if (allModels.isEmpty()) loadModels()
+            3 -> if (currentModels().isEmpty()) loadModels()
         }
     }
 
@@ -244,10 +253,10 @@ class MainActivity : Activity() {
             addView(tv(label, 12f, C.muted))
         }
 
-    private fun activeKeyId(keys: List<ApiKey>): String? {
-        val enabled = keys.filter { it.enabled }
+    private fun activeKeyId(keys: List<ApiKey>, pid: String): String? {
+        val enabled = keys.filter { it.provider == pid && it.enabled }
         val now = System.currentTimeMillis()
-        val a = ProxyService.activeKeyId
+        val a = ProxyService.activeKeys[pid]
         return enabled.firstOrNull { it.id == a }?.id
             ?: enabled.firstOrNull { (ProxyService.cooldownUntil[it.id] ?: 0L) <= now }?.id
             ?: enabled.firstOrNull()?.id
@@ -314,17 +323,31 @@ class MainActivity : Activity() {
                 .show()
         }, lp(top = 12))
         c2.addView(
-            tv("Model: type any OpenRouter model ID in the other app (see the Models tab).", 12f, C.muted),
-            lp(top = 12)
+            tv(
+                "Model names starting with gemini use your Gemini keys. Everything else uses OpenRouter.",
+                12f, C.muted
+            ),
+            lp(top = 14)
         )
+        c2.addView(tv("Gemini-only URL (for apps with a Gemini mode)", 12f, C.muted), lp(top = 12))
+        val r3 = hrow()
+        r3.addView(tv(baseUrlGemini, 13f, mono = true), lp(0, WRAP, weight = 1f))
+        r3.addView(pill("Copy") { copy(baseUrlGemini, "URL") })
+        c2.addView(r3, lp(top = 4))
         col.addView(c2)
 
         val c3 = card()
-        c3.addView(tv("KEY IN USE", 11f, C.muted, bold = true))
-        activeKeyText = tv("-", 20f, bold = true)
-        c3.addView(activeKeyText, lp(top = 4))
-        activeSubText = tv("", 13f, C.muted)
-        c3.addView(activeSubText, lp(top = 2))
+        c3.addView(tv("KEYS IN USE", 11f, C.muted, bold = true))
+        c3.addView(tv("OpenRouter", 12f, C.muted), lp(top = 10))
+        activeOr = tv("-", 18f, bold = true)
+        c3.addView(activeOr, lp(top = 2))
+        subOr = tv("", 12f, C.muted)
+        c3.addView(subOr, lp(top = 2))
+        c3.addView(tv("Gemini", 12f, C.muted), lp(top = 14))
+        activeGem = tv("-", 18f, bold = true)
+        c3.addView(activeGem, lp(top = 2))
+        subGem = tv("", 12f, C.muted)
+        c3.addView(subGem, lp(top = 2))
         col.addView(c3)
 
         val c4 = card()
@@ -337,6 +360,7 @@ class MainActivity : Activity() {
         sr.addView(statCol(todayTok, "Tokens"), lp(0, WRAP, weight = 1f))
         sr.addView(statCol(todayCost, "Cost"), lp(0, WRAP, weight = 1f))
         c4.addView(sr, lp(top = 8))
+        c4.addView(tv("Cost covers OpenRouter only. Gemini does not report cost.", 11f, C.muted), lp(top = 8))
         col.addView(c4)
 
         val c5 = card()
@@ -366,6 +390,21 @@ class MainActivity : Activity() {
         }, 600)
     }
 
+    private fun describeProvider(keys: List<ApiKey>, pid: String, label: TextView, sub: TextView) {
+        val group = keys.filter { it.provider == pid }
+        val enabled = group.filter { it.enabled }
+        val aid = activeKeyId(keys, pid)
+        label.text = group.firstOrNull { it.id == aid }?.label ?: "No key added"
+        val now = System.currentTimeMillis()
+        val cooling = enabled.count { (ProxyService.cooldownUntil[it.id] ?: 0L) > now }
+        sub.text = when {
+            group.isEmpty() -> "Add one in the Keys tab"
+            enabled.size < 2 -> "Add a second key to enable failover"
+            cooling > 0 -> "${enabled.size} keys enabled - $cooling cooling down - failover on"
+            else -> "${enabled.size} keys enabled - failover on"
+        }
+    }
+
     private fun refreshHome() {
         if (ProxyService.running) {
             proxyInfo.text = "Running"
@@ -381,18 +420,8 @@ class MainActivity : Activity() {
         universalView.text = Secrets.universalKey(this)
 
         val keys = Secrets.keys(this)
-        val enabled = keys.filter { it.enabled }
-        val aid = activeKeyId(keys)
-        val active = keys.firstOrNull { it.id == aid }
-        activeKeyText.text = active?.label ?: "No key added"
-        val now = System.currentTimeMillis()
-        val cooling = enabled.count { (ProxyService.cooldownUntil[it.id] ?: 0L) > now }
-        activeSubText.text = when {
-            keys.isEmpty() -> "Add a key in the Keys tab"
-            enabled.size < 2 -> "Add a second key to enable automatic failover"
-            cooling > 0 -> "${enabled.size} keys enabled - $cooling cooling down - failover on"
-            else -> "${enabled.size} keys enabled - failover on"
-        }
+        describeProvider(keys, "openrouter", activeOr, subOr)
+        describeProvider(keys, "gemini", activeGem, subGem)
 
         thread {
             val t = UsageDb.get(this).totals(startOfToday())
@@ -408,20 +437,20 @@ class MainActivity : Activity() {
 
     private fun buildKeys(): View {
         val col = pageColumn()
-
-        val top = hrow()
-        top.addView(tv("Your keys", 18f, bold = true), lp(0, WRAP, weight = 1f))
-        top.addView(pill("Add key", C.accent, Color.BLACK) { showAddKey() })
-        col.addView(top, lp(bottom = 6))
+        val head = hrow()
+        head.addView(tv("Your keys", 18f, bold = true), lp(0, WRAP, weight = 1f))
+        head.addView(pill("Add key", C.accent, Color.BLACK) { showAddKey() })
+        col.addView(head, lp(bottom = 6))
         col.addView(
             tv(
-                "Keys are tried from top to bottom. If one is rejected (invalid, out of credit, " +
-                    "rate limited) KeyHub switches to the next one automatically.",
+                "One list for all your keys. A Gemini model uses the first enabled Gemini key " +
+                    "in this list, any other model uses the first enabled OpenRouter key. If a key " +
+                    "is rejected (invalid, out of credit, rate limited) KeyHub tries the next key " +
+                    "of the same provider.",
                 12f, C.muted
             ),
-            lp(bottom = 14)
+            lp(bottom = 12)
         )
-
         keysBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(keysBox)
         col.addView(pill("Refresh balances") { fetchBalances() }, lp(top = 4))
@@ -430,8 +459,10 @@ class MainActivity : Activity() {
 
     private fun computeKeySig(): String {
         val keys = Secrets.keys(this)
-        val aid = activeKeyId(keys)
-        return keys.joinToString("|") { k -> k.id + k.label + k.enabled + keyStatus(k, aid).first }
+        return keys.joinToString("|") { k ->
+            k.id + k.label + k.enabled + k.provider +
+                keyStatus(k, activeKeyId(keys, k.provider)).first
+        }
     }
 
     private fun checkKeySig() {
@@ -455,11 +486,13 @@ class MainActivity : Activity() {
             keysBox.addView(c)
             return
         }
-        val aid = activeKeyId(keys)
         for ((i, k) in keys.withIndex()) {
-            keysBox.addView(keyCard(k, i, keys.size, aid, stats[k.id]))
+            keysBox.addView(keyCard(k, i, keys.size, activeKeyId(keys, k.provider), stats[k.id]))
         }
     }
+
+    private fun provColor(pid: String): Int =
+        if (pid == "gemini") Color.parseColor("#4FC3F7") else Color.parseColor("#B28DFF")
 
     private fun keyCard(k: ApiKey, index: Int, count: Int, activeId: String?, st: Totals?): View {
         val c = card()
@@ -467,19 +500,26 @@ class MainActivity : Activity() {
 
         val top = hrow()
         top.addView(tv(k.label, 16f, bold = true), lp(0, WRAP, weight = 1f))
-        top.addView(chip(statusText, statusColor))
+        top.addView(chip(if (k.provider == "gemini") "Gemini" else "OpenRouter", provColor(k.provider)))
+        top.addView(chip(statusText, statusColor), lp(start = 6))
         c.addView(top)
 
         val real = Secrets.keyValue(k)
         val masked = if (real == null) "unreadable" else real.take(8) + "..." + real.takeLast(4)
         c.addView(tv(masked, 12f, C.muted, mono = true), lp(top = 4))
 
-        c.addView(tv(balances[k.id] ?: "Balance: tap Refresh balances", 13f), lp(top = 10))
+        val defaultInfo = if (k.provider == "gemini") {
+            "Gemini does not report balance. Tap Refresh to check the key is valid."
+        } else {
+            "Balance: tap Refresh balances"
+        }
+        c.addView(tv(balances[k.id] ?: defaultInfo, 13f), lp(top = 10))
 
         val via = if (st == null) {
             "Through KeyHub: nothing yet"
         } else {
-            "Through KeyHub: ${st.ok} requests - ${st.tokens} tokens - ${usd(st.cost)}" +
+            val costPart = if (k.provider == "gemini") "" else " - ${usd(st.cost)}"
+            "Through KeyHub: ${st.ok} requests - ${st.tokens} tokens$costPart" +
                 (if (st.failed > 0) " - ${st.failed} failed" else "")
         }
         c.addView(tv(via, 12f, C.muted), lp(top = 4))
@@ -520,17 +560,52 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), 0)
         }
+        val sel = arrayOf("openrouter")
         val label = field("Label (e.g. Main, Backup)")
-        val key = field("sk-or-v1-...", password = true)
+        val key = field("Paste the key", password = true)
+        val pills = ArrayList<TextView>()
+        fun styleSel() {
+            for ((i, pair) in providers.withIndex()) {
+                if (sel[0] == pair.first) stylePill(pills[i], C.accent, Color.BLACK)
+                else stylePill(pills[i], C.card2, C.text)
+            }
+        }
+        val pr = hrow()
+        for ((i, pair) in providers.withIndex()) {
+            val p = pill(pair.second) {
+                sel[0] = pair.first
+                styleSel()
+            }
+            pills.add(p)
+            pr.addView(p, lp(start = if (i > 0) 8 else 0))
+        }
+        styleSel()
+        key.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                val t = s?.toString()?.trim() ?: ""
+                if (t.startsWith("AIza")) {
+                    sel[0] = "gemini"
+                    styleSel()
+                } else if (t.startsWith("sk-or-")) {
+                    sel[0] = "openrouter"
+                    styleSel()
+                }
+            }
+
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+        })
         box.addView(label, lp(bottom = 10))
-        box.addView(key)
+        box.addView(key, lp(bottom = 14))
+        box.addView(tv("Provider (detected from the key when possible)", 12f, C.muted), lp(bottom = 6))
+        box.addView(pr)
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("Add OpenRouter key")
+            .setTitle("Add key")
             .setView(box)
             .setPositiveButton("Add") { _, _ ->
                 val kv = key.text.toString().trim()
                 if (kv.isNotEmpty()) {
-                    Secrets.addKey(this, label.text.toString(), kv)
+                    Secrets.addKey(this, label.text.toString(), kv, sel[0])
                     rebuildKeys()
                     fetchBalances()
                 }
@@ -561,7 +636,7 @@ class MainActivity : Activity() {
     private fun confirmDelete(k: ApiKey) {
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
             .setTitle("Delete ${k.label}?")
-            .setMessage("The key is removed from KeyHub. It stays valid on OpenRouter.")
+            .setMessage("The key is removed from KeyHub. It stays valid with the provider.")
             .setPositiveButton("Delete") { _, _ ->
                 Secrets.removeKey(this, k.id)
                 balances.remove(k.id)
@@ -571,9 +646,9 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun getJson(url: String, key: String?): JSONObject {
+    private fun getJson(url: String, headerName: String?, headerValue: String?): JSONObject {
         val c = URL(url).openConnection() as HttpURLConnection
-        if (key != null) c.setRequestProperty("Authorization", "Bearer $key")
+        if (headerName != null && headerValue != null) c.setRequestProperty(headerName, headerValue)
         c.connectTimeout = 15000
         c.readTimeout = 20000
         val code = c.responseCode
@@ -584,15 +659,39 @@ class MainActivity : Activity() {
         return JSONObject(s)
     }
 
+    private fun httpCode(url: String, headerName: String, headerValue: String): Int {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.setRequestProperty(headerName, headerValue)
+        c.connectTimeout = 15000
+        c.readTimeout = 20000
+        val code = c.responseCode
+        c.disconnect()
+        return code
+    }
+
     private fun fetchBalances() {
         val keys = Secrets.keys(this)
         if (keys.isEmpty()) return
         thread {
             for (k in keys) {
                 val real = Secrets.keyValue(k) ?: continue
+                if (k.provider == "gemini") {
+                    balances[k.id] = try {
+                        val code = httpCode(
+                            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+                            "x-goog-api-key", real
+                        )
+                        if (code == 200) "Key is valid. Gemini does not report balance."
+                        else "Key rejected (HTTP $code)"
+                    } catch (e: Exception) {
+                        "Could not check key (${e.message})"
+                    }
+                    continue
+                }
                 val sb = StringBuilder()
                 try {
-                    val d = getJson("https://openrouter.ai/api/v1/key", real).getJSONObject("data")
+                    val d = getJson("https://openrouter.ai/api/v1/key", "Authorization", "Bearer $real")
+                        .getJSONObject("data")
                     val used = d.dbl("usage")
                     val limit = d.dbl("limit")
                     val rem = d.dbl("limit_remaining")
@@ -605,7 +704,8 @@ class MainActivity : Activity() {
                     sb.append("Could not check key (${e.message})")
                 }
                 try {
-                    val d = getJson("https://openrouter.ai/api/v1/credits", real).getJSONObject("data")
+                    val d = getJson("https://openrouter.ai/api/v1/credits", "Authorization", "Bearer $real")
+                        .getJSONObject("data")
                     val total = d.dbl("total_credits")
                     val used = d.dbl("total_usage")
                     if (total != null && used != null) {
@@ -709,6 +809,7 @@ class MainActivity : Activity() {
         val fmt = SimpleDateFormat("MMM d, HH:mm:ss", Locale.US)
         val c = card(0)
         val ok = r.status in 200..399
+        val gem = r.provider == "gemini"
 
         val l1 = hrow()
         val name = tv(if (r.model.isEmpty()) "unknown model" else r.model, 14f, bold = true)
@@ -718,7 +819,7 @@ class MainActivity : Activity() {
         l1.addView(chip(r.status.toString(), if (ok) C.green else C.red))
         c.addView(l1)
 
-        var meta = fmt.format(Date(r.ts))
+        var meta = fmt.format(Date(r.ts)) + "  -  " + (if (gem) "Gemini" else "OpenRouter")
         if (r.keyLabel.isNotEmpty()) meta += "  -  " + r.keyLabel
         if (r.latency > 0) {
             meta += if (r.latency >= 1000) {
@@ -735,7 +836,11 @@ class MainActivity : Activity() {
                 tv("in ${r.prompt}   out ${r.completion}   total ${r.total}", 13f),
                 lp(0, WRAP, weight = 1f)
             )
-            l3.addView(tv(usd(r.cost), 13f, C.accent, bold = true))
+            if (gem) {
+                l3.addView(tv("no cost data", 12f, C.muted))
+            } else {
+                l3.addView(tv(usd(r.cost), 13f, C.accent, bold = true))
+            }
             c.addView(l3, lp(top = 8))
         } else {
             c.addView(tv("Request failed - the next key was tried if available", 12f, C.red), lp(top = 8))
@@ -766,12 +871,28 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ MODELS
 
+    private fun currentModels(): List<ModelInfo> = if (modelProvider == 0) orModels else gemModels
+
     private fun buildModels(): View {
         val outer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), dp(4))
         }
+
+        val pr = hrow()
+        for ((i, pair) in providers.withIndex()) {
+            val p = pill(pair.second) {
+                modelProvider = i
+                styleModelPills()
+                if (currentModels().isEmpty()) loadModels()
+                applyModelFilter()
+            }
+            provPills.add(p)
+            pr.addView(p, lp(start = if (i > 0) 8 else 0))
+        }
+        top.addView(pr, lp(bottom = 10))
+
         modelSearch = field("Search models")
         modelSearch.addTextChangedListener(object : TextWatcher {
             override fun afterTextChanged(s: Editable?) {
@@ -812,9 +933,14 @@ class MainActivity : Activity() {
     }
 
     private fun styleModelPills() {
+        for ((i, p) in provPills.withIndex()) {
+            if (i == modelProvider) stylePill(p, C.accent, Color.BLACK) else stylePill(p, C.card2, C.text)
+        }
         for ((i, p) in modelPills.withIndex()) {
             val on = (i == 1) == freeOnly
             if (on) stylePill(p, C.accent, Color.BLACK) else stylePill(p, C.card2, C.text)
+            // the free filter only makes sense for OpenRouter
+            p.visibility = if (modelProvider == 0) View.VISIBLE else View.GONE
         }
     }
 
@@ -832,31 +958,40 @@ class MainActivity : Activity() {
         c.addView(l1)
         c.addView(tv(m.name, 12f, C.muted), lp(top = 2))
         val ctxK = if (m.ctx > 0) "${m.ctx / 1000}k context" else "context n/a"
-        c.addView(
-            tv("in ${price(m.promptPer1M)} / out ${price(m.compPer1M)} per 1M tokens  -  $ctxK", 12f),
-            lp(top = 6)
-        )
+        val info = if (m.promptPer1M == geminiNoPrice) {
+            ctxK
+        } else {
+            "in ${price(m.promptPer1M)} / out ${price(m.compPer1M)} per 1M tokens  -  $ctxK"
+        }
+        c.addView(tv(info, 12f), lp(top = 6))
         return wrapRow(c)
     }
 
     private fun applyModelFilter() {
         val q = modelSearch.text.toString().trim().lowercase()
-        val list = allModels.filter {
-            (!freeOnly || it.free) &&
+        val useFree = freeOnly && modelProvider == 0
+        val list = currentModels().filter {
+            (!useFree || it.free) &&
                 (q.isEmpty() || it.id.lowercase().contains(q) || it.name.lowercase().contains(q))
         }
         modelAdapter.items = list
         modelAdapter.notifyDataSetChanged()
-        if (allModels.isNotEmpty()) modelStatus.text = "${list.size} models - tap one to copy its ID"
+        if (currentModels().isNotEmpty()) {
+            modelStatus.text = "${list.size} models - tap one to copy its ID"
+        }
     }
 
     private fun loadModels() {
-        if (modelsLoading) return
-        modelsLoading = true
+        if (modelProvider == 0) loadOpenRouterModels() else loadGeminiModels()
+    }
+
+    private fun loadOpenRouterModels() {
+        if (orLoading) return
+        orLoading = true
         modelStatus.text = "Loading models..."
         thread {
             try {
-                val arr = getJson("https://openrouter.ai/api/v1/models", null).getJSONArray("data")
+                val arr = getJson("https://openrouter.ai/api/v1/models", null, null).getJSONArray("data")
                 val out = ArrayList<ModelInfo>()
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
@@ -868,15 +1003,66 @@ class MainActivity : Activity() {
                     out.add(ModelInfo(id, o.optString("name", id), o.optInt("context_length", 0), p, cp))
                 }
                 out.sortBy { it.id }
-                allModels = out
+                orModels = out
                 runOnUiThread {
-                    modelsLoading = false
-                    applyModelFilter()
+                    orLoading = false
+                    if (modelProvider == 0) applyModelFilter()
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    modelsLoading = false
-                    modelStatus.text = "Could not load models: ${e.message}"
+                    orLoading = false
+                    if (modelProvider == 0) modelStatus.text = "Could not load models: ${e.message}"
+                }
+            }
+        }
+    }
+
+    private fun loadGeminiModels() {
+        if (gemLoading) return
+        val key = Secrets.keys(this).firstOrNull { it.provider == "gemini" && it.enabled }
+        val real = if (key == null) null else Secrets.keyValue(key)
+        if (real == null) {
+            modelStatus.text = "Add a Gemini key in the Keys tab to load Gemini models."
+            return
+        }
+        gemLoading = true
+        modelStatus.text = "Loading models..."
+        thread {
+            try {
+                val arr = getJson(
+                    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+                    "x-goog-api-key", real
+                ).getJSONArray("models")
+                val out = ArrayList<ModelInfo>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val methods = o.optJSONArray("supportedGenerationMethods")
+                    var chat = false
+                    if (methods != null) {
+                        for (j in 0 until methods.length()) {
+                            if (methods.optString(j) == "generateContent") chat = true
+                        }
+                    }
+                    if (!chat) continue
+                    val id = o.optString("name", "").removePrefix("models/")
+                    if (id.isEmpty()) continue
+                    out.add(
+                        ModelInfo(
+                            id, o.optString("displayName", id), o.optInt("inputTokenLimit", 0),
+                            geminiNoPrice, geminiNoPrice
+                        )
+                    )
+                }
+                out.sortBy { it.id }
+                gemModels = out
+                runOnUiThread {
+                    gemLoading = false
+                    if (modelProvider == 1) applyModelFilter()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    gemLoading = false
+                    if (modelProvider == 1) modelStatus.text = "Could not load models: ${e.message}"
                 }
             }
         }

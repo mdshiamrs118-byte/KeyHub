@@ -17,7 +17,13 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-data class ApiKey(val id: String, val label: String, val enc: String, val enabled: Boolean)
+data class ApiKey(
+    val id: String,
+    val label: String,
+    val enc: String,
+    val enabled: Boolean,
+    val provider: String = "openrouter"
+)
 
 /** Encrypted storage for the OpenRouter keys + the universal key. */
 object Secrets {
@@ -77,6 +83,7 @@ object Secrets {
                     .put("label", k.label)
                     .put("enc", k.enc)
                     .put("enabled", k.enabled)
+                    .put("provider", k.provider)
             )
         }
         prefs(c).edit().putString("keys_json", a.toString()).apply()
@@ -96,7 +103,8 @@ object Secrets {
                             o.getString("id"),
                             o.optString("label", "Key"),
                             o.getString("enc"),
-                            o.optBoolean("enabled", true)
+                            o.optBoolean("enabled", true),
+                            o.optString("provider", "openrouter")
                         )
                     )
                 }
@@ -116,10 +124,12 @@ object Secrets {
     fun keys(c: Context): List<ApiKey> = loadKeys(c)
 
     @Synchronized
-    fun addKey(c: Context, label: String, key: String) {
+    fun addKey(c: Context, label: String, key: String, provider: String) {
         val l = loadKeys(c)
-        val name = if (label.isBlank()) "Key ${l.size + 1}" else label.trim()
-        l.add(ApiKey(newId(), name, encrypt(key), true))
+        val n = l.count { it.provider == provider } + 1
+        val pn = if (provider == "gemini") "Gemini" else "OpenRouter"
+        val name = if (label.isBlank()) "$pn $n" else label.trim()
+        l.add(ApiKey(newId(), name, encrypt(key), true, provider))
         saveKeys(c, l)
     }
 
@@ -144,12 +154,11 @@ object Secrets {
         val l = loadKeys(c)
         val i = l.indexOfFirst { it.id == id }
         val j = i + delta
-        if (i >= 0 && j >= 0 && j < l.size) {
-            val t = l[i]
-            l[i] = l[j]
-            l[j] = t
-            saveKeys(c, l)
-        }
+        if (i < 0 || j < 0 || j >= l.size) return
+        val t = l[i]
+        l[i] = l[j]
+        l[j] = t
+        saveKeys(c, l)
     }
 
     fun keyValue(k: ApiKey): String? = decrypt(k.enc)
@@ -188,17 +197,18 @@ data class UsageRow(
     val path: String,
     val keyId: String,
     val keyLabel: String,
-    val latency: Long
+    val latency: Long,
+    val provider: String = ""
 )
 
 data class Totals(val ok: Int, val failed: Int, val tokens: Long, val cost: Double)
 
-class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.db", null, 2) {
+class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, model TEXT, " +
                 "prompt INTEGER, completion INTEGER, total INTEGER, cost REAL, status INTEGER, " +
-                "path TEXT, key_id TEXT, key_label TEXT, latency INTEGER DEFAULT 0)"
+                "path TEXT, key_id TEXT, key_label TEXT, latency INTEGER DEFAULT 0, provider TEXT)"
         )
     }
 
@@ -207,6 +217,9 @@ class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.d
             db.execSQL("ALTER TABLE log ADD COLUMN key_id TEXT")
             db.execSQL("ALTER TABLE log ADD COLUMN key_label TEXT")
             db.execSQL("ALTER TABLE log ADD COLUMN latency INTEGER DEFAULT 0")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE log ADD COLUMN provider TEXT")
         }
     }
 
@@ -223,6 +236,7 @@ class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.d
         v.put("key_id", r.keyId)
         v.put("key_label", r.keyLabel)
         v.put("latency", r.latency)
+        v.put("provider", r.provider)
         writableDatabase.insert("log", null, v)
     }
 
@@ -231,7 +245,7 @@ class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.d
         val where = StringBuilder("ts >= $since")
         if (errorsOnly) where.append(" AND status >= 400")
         readableDatabase.rawQuery(
-            "SELECT ts,model,prompt,completion,total,cost,status,path,key_id,key_label,latency " +
+            "SELECT ts,model,prompt,completion,total,cost,status,path,key_id,key_label,latency,provider " +
                 "FROM log WHERE $where ORDER BY id DESC LIMIT $n",
             null
         ).use { c ->
@@ -240,7 +254,7 @@ class UsageDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "usage.d
                     UsageRow(
                         c.getLong(0), c.getString(1) ?: "", c.getInt(2), c.getInt(3),
                         c.getInt(4), c.getDouble(5), c.getInt(6), c.getString(7) ?: "",
-                        c.getString(8) ?: "", c.getString(9) ?: "", c.getLong(10)
+                        c.getString(8) ?: "", c.getString(9) ?: "", c.getLong(10), c.getString(11) ?: ""
                     )
                 )
             }

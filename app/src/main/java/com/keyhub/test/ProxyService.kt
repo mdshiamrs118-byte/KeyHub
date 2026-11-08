@@ -9,7 +9,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
@@ -31,17 +33,21 @@ class UsageInfo {
 }
 
 /**
- * Local OpenAI-compatible proxy on 127.0.0.1:8787.
- * Other apps use  http://127.0.0.1:8787/v1  +  the universal key.
- * We pick one of your OpenRouter keys, forward the request, stream the answer
- * back, and log token usage. If a key fails (invalid / out of credit / rate
- * limited) the next key is tried automatically.
+ * Local proxy on 127.0.0.1:8787 for OpenRouter and Gemini.
+ *
+ * Other apps use  http://127.0.0.1:8787/v1  + the universal key.
+ *  - model names starting with "gemini" go to Gemini (OpenAI-compatible endpoint)
+ *  - everything else goes to OpenRouter
+ *  - /gemini/...  forces Gemini (also supports native Gemini paths like
+ *    /gemini/v1beta/models/<model>:generateContent)
+ * If a key is rejected the next key of the same provider is tried automatically.
  */
 class ProxyService : Service() {
 
     companion object {
         const val PORT = 8787
         private const val CHANNEL = "keyhub_proxy"
+        private const val GEMINI_HOST = "https://generativelanguage.googleapis.com"
         private const val CORS =
             "Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: *\r\n"
 
@@ -51,9 +57,8 @@ class ProxyService : Service() {
         @Volatile
         var lastError: String? = null
 
-        /** id of the key that served the last successful request */
-        @Volatile
-        var activeKeyId: String? = null
+        /** provider -> id of the key that served the last successful request */
+        val activeKeys = ConcurrentHashMap<String, String>()
 
         /** key id -> time (ms) until which the key is skipped */
         val cooldownUntil = ConcurrentHashMap<String, Long>()
@@ -61,11 +66,12 @@ class ProxyService : Service() {
         /** key id -> last failing HTTP status */
         val lastFailCode = ConcurrentHashMap<String, Int>()
 
-        private val FAILOVER = setOf(401, 402, 403, 429)
+        private val FAILOVER_OR = setOf(401, 402, 403, 429)
+        private val FAILOVER_GEM = setOf(401, 403, 429)
 
         private val SKIP_REQ = setOf(
-            "host", "authorization", "x-api-key", "content-length", "connection",
-            "accept-encoding", "transfer-encoding", "expect", "keep-alive",
+            "host", "authorization", "x-api-key", "x-goog-api-key", "content-length",
+            "connection", "accept-encoding", "transfer-encoding", "expect", "keep-alive",
             "proxy-connection", "upgrade"
         )
     }
@@ -194,6 +200,17 @@ class ProxyService : Service() {
     // ---------- usage parsing ----------
 
     private fun applyJson(o: JSONObject, u: UsageInfo) {
+        // native Gemini format
+        val um = o.optJSONObject("usageMetadata")
+        if (um != null) {
+            u.prompt = um.optInt("promptTokenCount", 0)
+            u.completion = um.optInt("candidatesTokenCount", 0) + um.optInt("thoughtsTokenCount", 0)
+            u.total = um.optInt("totalTokenCount", u.prompt + u.completion)
+            val mv = o.optString("modelVersion", "")
+            if (mv.isNotEmpty()) u.model = mv
+            return
+        }
+        // OpenAI-style format (OpenRouter and Gemini compat)
         val us = o.optJSONObject("usage") ?: return
         val m = o.optString("model", "")
         if (m.isNotEmpty()) u.model = m
@@ -207,22 +224,40 @@ class ProxyService : Service() {
         val t = l.trim()
         if (!t.startsWith("data:")) return
         val p = t.substring(5).trim()
-        if (p == "[DONE]" || !p.contains("\"usage\"")) return
+        if (p == "[DONE]") return
+        if (!p.contains("\"usage\"") && !p.contains("usageMetadata")) return
         try {
             applyJson(JSONObject(p), u)
         } catch (_: Exception) {
         }
     }
 
+    private fun parseBuffered(text: String, u: UsageInfo) {
+        val t = text.trim()
+        try {
+            if (t.startsWith("[")) {
+                val arr = JSONArray(t)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i)
+                    if (o != null) applyJson(o, u)
+                }
+            } else {
+                applyJson(JSONObject(t), u)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun logRow(
-        k: ApiKey?, model: String, u: UsageInfo?, status: Int, path: String, ms: Long
+        k: ApiKey?, provider: String, model: String, u: UsageInfo?,
+        status: Int, path: String, ms: Long
     ) {
         try {
             UsageDb.get(this).add(
                 UsageRow(
                     System.currentTimeMillis(), model,
                     u?.prompt ?: 0, u?.completion ?: 0, u?.total ?: 0, u?.cost ?: 0.0,
-                    status, path, k?.id ?: "", k?.label ?: "", ms
+                    status, path, k?.id ?: "", k?.label ?: "", ms, provider
                 )
             )
         } catch (_: Exception) {
@@ -230,7 +265,8 @@ class ProxyService : Service() {
     }
 
     private fun openUpstream(
-        url: String, method: String, headers: Map<String, String>, body: ByteArray, real: String
+        url: String, method: String, headers: Map<String, String>, body: ByteArray,
+        real: String, provider: String, native: Boolean
     ): HttpURLConnection {
         val c = URL(url).openConnection() as HttpURLConnection
         c.requestMethod = method
@@ -240,7 +276,11 @@ class ProxyService : Service() {
         for ((k, v) in headers) {
             if (k !in SKIP_REQ) c.setRequestProperty(k, v)
         }
-        c.setRequestProperty("Authorization", "Bearer $real")
+        if (provider == "gemini" && native) {
+            c.setRequestProperty("x-goog-api-key", real)
+        } else {
+            c.setRequestProperty("Authorization", "Bearer $real")
+        }
         c.setRequestProperty("Accept-Encoding", "identity")
         if (body.isNotEmpty() && method != "GET" && method != "HEAD") {
             c.doOutput = true
@@ -309,50 +349,122 @@ class ProxyService : Service() {
             return
         }
 
-        // auth with universal key
+        // optional provider prefix
+        val forced: String? = when {
+            target.startsWith("/gemini/") -> "gemini"
+            target.startsWith("/openrouter/") -> "openrouter"
+            else -> null
+        }
+        val stripped = when (forced) {
+            "gemini" -> target.removePrefix("/gemini")
+            "openrouter" -> target.removePrefix("/openrouter")
+            else -> target
+        }
+        val qIdx = stripped.indexOf('?')
+        val pathOnly = if (qIdx >= 0) stripped.substring(0, qIdx) else stripped
+        val query = if (qIdx >= 0) stripped.substring(qIdx + 1) else ""
+        val queryParts = query.split("&").filter { it.isNotEmpty() }
+        val cleanQuery = queryParts.filter { !it.startsWith("key=") }.joinToString("&")
+
+        // auth with the universal key (header or ?key= for native Gemini clients)
         val a = headers["authorization"]
-        val token = if (a != null && a.startsWith("bearer ", ignoreCase = true)) {
-            a.substring(7).trim()
-        } else {
-            headers["x-api-key"] ?: ""
+        val token = when {
+            a != null && a.startsWith("bearer ", ignoreCase = true) -> a.substring(7).trim()
+            headers["x-api-key"] != null -> headers["x-api-key"] ?: ""
+            headers["x-goog-api-key"] != null -> headers["x-goog-api-key"] ?: ""
+            else -> queryParts.firstOrNull { it.startsWith("key=") }?.removePrefix("key=") ?: ""
         }
         if (token != Secrets.universalKey(this)) {
             sendSimple(out, 401, errJson("Invalid KeyHub key", 401))
             return
         }
 
-        val keys = Secrets.keys(this).filter { it.enabled }
-        if (keys.isEmpty()) {
-            sendSimple(out, 503, errJson("No enabled OpenRouter key in KeyHub", 503))
-            return
-        }
-        val nowMs = System.currentTimeMillis()
-        val ready = keys.filter { (cooldownUntil[it.id] ?: 0L) <= nowMs }
-        val order = ready + keys.filter { k -> ready.none { it.id == k.id } }
-
-        // build upstream path
-        var p = target
-        if (p.startsWith("/api/")) p = p.removePrefix("/api")
-        if (!p.startsWith("/v1")) p = "/v1" + (if (p.startsWith("/")) p else "/$p")
-        val url = "https://openrouter.ai/api$p"
-
-        // read model + ask OpenRouter to include usage
+        // read the model name from a JSON body
         var reqModel = ""
+        var bodyJson: JSONObject? = null
         if (method == "POST" && body.isNotEmpty() &&
             (headers["content-type"] ?: "").contains("json", ignoreCase = true)
         ) {
             try {
                 val o = JSONObject(String(body, Charsets.UTF_8))
+                bodyJson = o
                 reqModel = o.optString("model", "")
-                if (p.contains("chat/completions")) {
-                    o.put("usage", JSONObject().put("include", true))
-                    if (o.optBoolean("stream", false)) {
-                        val so = o.optJSONObject("stream_options") ?: JSONObject()
-                        so.put("include_usage", true)
-                        o.put("stream_options", so)
-                    }
-                    body = o.toString().toByteArray(Charsets.UTF_8)
+            } catch (_: Exception) {
+            }
+        }
+
+        // native Gemini API paths (generateContent etc.)
+        val native = pathOnly.contains(":generateContent") ||
+            pathOnly.contains(":streamGenerateContent") ||
+            pathOnly.contains(":countTokens") ||
+            pathOnly.contains(":embedContent") ||
+            pathOnly.contains(":batchEmbedContents") ||
+            (pathOnly.startsWith("/v1beta/") && !pathOnly.startsWith("/v1beta/openai"))
+
+        val allKeys = Secrets.keys(this).filter { it.enabled }
+        val lm = reqModel.lowercase()
+        var provider: String = when {
+            forced != null -> forced
+            native -> "gemini"
+            lm.startsWith("gemini") || lm.startsWith("models/gemini") || lm.startsWith("gemma") -> "gemini"
+            else -> "openrouter"
+        }
+        // model list request with only Gemini keys present
+        if (forced == null && reqModel.isEmpty() && provider == "openrouter" &&
+            allKeys.none { it.provider == "openrouter" } && allKeys.any { it.provider == "gemini" }
+        ) {
+            provider = "gemini"
+        }
+        val providerName = if (provider == "gemini") "Gemini" else "OpenRouter"
+
+        val keys = allKeys.filter { it.provider == provider }
+        if (keys.isEmpty()) {
+            sendSimple(out, 503, errJson("No enabled $providerName key in KeyHub", 503))
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        val ready = keys.filter { (cooldownUntil[it.id] ?: 0L) <= nowMs }
+        val order = ready + keys.filter { k -> ready.none { it.id == k.id } }
+        val failoverCodes = if (provider == "gemini") FAILOVER_GEM else FAILOVER_OR
+
+        // build upstream URL
+        val url: String
+        val p: String
+        if (provider == "gemini") {
+            if (native) {
+                p = if (pathOnly.startsWith("/")) pathOnly else "/$pathOnly"
+                url = GEMINI_HOST + p + (if (cleanQuery.isNotEmpty()) "?$cleanQuery" else "")
+                if (reqModel.isEmpty()) {
+                    reqModel = Regex("models/([^:/]+)").find(pathOnly)?.groupValues?.get(1) ?: ""
                 }
+            } else {
+                var rest = pathOnly.removePrefix("/v1beta/openai").removePrefix("/v1")
+                if (!rest.startsWith("/")) rest = "/$rest"
+                p = rest
+                url = "$GEMINI_HOST/v1beta/openai$rest" +
+                    (if (cleanQuery.isNotEmpty()) "?$cleanQuery" else "")
+            }
+        } else {
+            var q = pathOnly
+            if (q.startsWith("/api/")) q = q.removePrefix("/api")
+            if (!q.startsWith("/v1")) q = "/v1" + (if (q.startsWith("/")) q else "/$q")
+            p = q
+            url = "https://openrouter.ai/api$q" + (if (cleanQuery.isNotEmpty()) "?$cleanQuery" else "")
+        }
+
+        // ask the provider to include usage numbers
+        val bj = bodyJson
+        if (bj != null && !native && p.contains("chat/completions")) {
+            try {
+                if (provider == "openrouter") {
+                    bj.put("usage", JSONObject().put("include", true))
+                }
+                if (bj.optBoolean("stream", false)) {
+                    val so = bj.optJSONObject("stream_options") ?: JSONObject()
+                    so.put("include_usage", true)
+                    bj.put("stream_options", so)
+                }
+                body = bj.toString().toByteArray(Charsets.UTF_8)
             } catch (_: Exception) {
             }
         }
@@ -360,6 +472,7 @@ class ProxyService : Service() {
         val usage = UsageInfo()
         var statusCode = 0
         var usedKey: ApiKey? = null
+        var preRead: ByteArray? = null
         var conn: HttpURLConnection? = null
         val t0 = System.currentTimeMillis()
         try {
@@ -370,14 +483,30 @@ class ProxyService : Service() {
                 val isLast = idx == order.size - 1
                 var c: HttpURLConnection? = null
                 try {
-                    c = openUpstream(url, method, headers, body, real)
+                    c = openUpstream(url, method, headers, body, real, provider, native)
                     val code = c.responseCode
-                    if (code in FAILOVER && !isLast) {
+                    var fail = code in failoverCodes
+                    var pre: ByteArray? = null
+                    if (!fail && provider == "gemini" && code == 400) {
+                        // Gemini answers a bad key with 400 "API key not valid"
+                        pre = try {
+                            c.errorStream?.readBytes()
+                        } catch (_: Exception) {
+                            null
+                        }
+                        val txt = if (pre != null) String(pre, Charsets.UTF_8) else ""
+                        if (txt.contains("API key", ignoreCase = true) ||
+                            txt.contains("API_KEY_INVALID")
+                        ) {
+                            fail = true
+                        }
+                    }
+                    if (fail && !isLast) {
                         cooldownUntil[k.id] =
                             System.currentTimeMillis() + (if (code == 429) 60_000L else 600_000L)
                         lastFailCode[k.id] = code
                         if (method == "POST") {
-                            logRow(k, reqModel, null, code, p, System.currentTimeMillis() - t0)
+                            logRow(k, provider, reqModel, null, code, p, System.currentTimeMillis() - t0)
                         }
                         c.disconnect()
                         continue
@@ -385,6 +514,7 @@ class ProxyService : Service() {
                     conn = c
                     usedKey = k
                     statusCode = code
+                    preRead = pre
                     break
                 } catch (e: Exception) {
                     try {
@@ -400,15 +530,20 @@ class ProxyService : Service() {
             if (key != null && statusCode < 400) {
                 cooldownUntil.remove(key.id)
                 lastFailCode.remove(key.id)
-                activeKeyId = key.id
-            } else if (key != null && statusCode in FAILOVER) {
+                activeKeys[provider] = key.id
+            } else if (key != null && (statusCode in failoverCodes)) {
                 cooldownUntil[key.id] =
                     System.currentTimeMillis() + (if (statusCode == 429) 60_000L else 600_000L)
                 lastFailCode[key.id] = statusCode
             }
 
             val ctype = cn.contentType ?: "application/json"
-            val upstream: InputStream? = if (statusCode >= 400) cn.errorStream else cn.inputStream
+            val pr = preRead
+            val upstream: InputStream? = when {
+                pr != null -> ByteArrayInputStream(pr)
+                statusCode >= 400 -> cn.errorStream
+                else -> cn.inputStream
+            }
             val msg = cn.responseMessage?.takeIf { it.isNotBlank() }
                 ?: (if (statusCode < 400) "OK" else "Error")
 
@@ -447,17 +582,12 @@ class ProxyService : Service() {
                 }
             }
             if (isSse && line.size() > 0) scanLine(line.toString("UTF-8"), usage)
-            if (!isSse && cap.size() > 0) {
-                try {
-                    applyJson(JSONObject(cap.toString("UTF-8")), usage)
-                } catch (_: Exception) {
-                }
-            }
+            if (!isSse && cap.size() > 0) parseBuffered(cap.toString("UTF-8"), usage)
         } catch (e: Exception) {
             if (statusCode == 0) {
                 statusCode = 502
                 try {
-                    sendSimple(out, 502, errJson("KeyHub could not reach OpenRouter: ${e.message}", 502))
+                    sendSimple(out, 502, errJson("KeyHub could not reach $providerName: ${e.message}", 502))
                 } catch (_: Exception) {
                 }
             }
@@ -470,7 +600,7 @@ class ProxyService : Service() {
 
         if (method == "POST") {
             logRow(
-                usedKey, usage.model.ifEmpty { reqModel }, usage, statusCode, p,
+                usedKey, provider, usage.model.ifEmpty { reqModel }, usage, statusCode, p,
                 System.currentTimeMillis() - t0
             )
         }
